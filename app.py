@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -15,12 +15,22 @@ import base64
 import json
 import time
 import os
+import sys
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from urllib.parse import urljoin
+
+# Fix for Playwright on Windows:
+# https://github.com/microsoft/playwright-python/issues/1342
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsProactorEventLoopPolicy())
+
 try:
     from config import NETWORK_CONFIG, CONTENT_CONFIG, SERVICE_CONFIG, LOG_CONFIG
 except ImportError:
     # 如果配置文件不存在，使用默认配置
     NETWORK_CONFIG = {
-        "timeout": {"total": 60, "connect": 15},
+        "timeout": {"connect": 15, "read": 60},
         "retries": {"max_attempts": 3, "delay_factor": 2},
         "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -95,6 +105,44 @@ app = FastAPI(
         "url": "https://opensource.org/licenses/MIT",
     },
 )
+
+# 应用启动时初始化Playwright
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Starting up Playwright...")
+    app.state.playwright = await async_playwright().start()
+    proxy_config = NETWORK_CONFIG.get("proxy", {})
+    proxy_url = proxy_config.get("https") or proxy_config.get("http")
+    
+    launch_options = {
+        "headless": True,
+        "args": [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--no-zygote',
+            '--disable-gpu'
+        ]
+    }
+    
+    if proxy_url:
+        logger.info(f"Playwright using proxy: {proxy_url}")
+        launch_options["proxy"] = {"server": proxy_url}
+        
+    app.state.browser = await app.state.playwright.chromium.launch(**launch_options)
+    logger.info("Playwright started successfully.")
+
+# 应用关闭时清理Playwright资源
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutting down Playwright...")
+    if hasattr(app.state, 'browser') and app.state.browser.is_connected():
+        await app.state.browser.close()
+    if hasattr(app.state, 'playwright'):
+        await app.state.playwright.stop()
+    logger.info("Playwright shut down successfully.")
 
 # 添加CORS中间件
 app.add_middleware(
@@ -262,69 +310,36 @@ def format_timestamp() -> str:
     """返回UTC时间戳"""
     return datetime.now(pytz.UTC).isoformat()
 
-def create_proxy_connector():
-    """创建代理连接器"""
-    proxy_config = NETWORK_CONFIG.get("proxy", {})
-    if not proxy_config.get("enabled", False):
-        return None
-        
-    # 构建代理URL
-    proxy_url = proxy_config.get("https") or proxy_config.get("http")
-    if not proxy_url:
-        return None
-        
-    # 如果需要认证
-    auth = proxy_config.get("auth", {})
-    if auth.get("username") and auth.get("password"):
-        from urllib.parse import urlparse, urlunparse
-        
-        parsed = urlparse(proxy_url)
-        # 重构URL包含认证信息
-        new_netloc = f"{auth['username']}:{auth['password']}@{parsed.netloc}"
-        proxy_url = urlunparse(parsed._replace(netloc=new_netloc))
+async def extract_content_with_playwright(browser, url: str, include_images: bool, include_links: bool, max_length: int) -> PageContent:
+    """使用Playwright提取内容（适用于需要JS渲染或反爬虫强的网站）"""
+    logger.info(f"Using shared Playwright browser for {url}")
     
-    return proxy_url
+    # 为每个请求创建独立的浏览器上下文
+    context = await browser.new_context()
+    page = await context.new_page()
+    
+    try:
+        # 增加页面加载超时
+        await page.goto(url, timeout=NETWORK_CONFIG["timeout"].get("read", 60) * 1000, wait_until='domcontentloaded')
+        
+        # 等待一段时间让动态内容加载
+        await asyncio.sleep(3) 
+        
+        html_content = await page.content()
+        soup = BeautifulSoup(html_content, 'html.parser')
+        
+        return process_soup_content(soup, url, include_images, include_links, max_length)
+        
+    except PlaywrightTimeoutError:
+        logger.error(f"Playwright timed out loading page: {url}")
+        raise Exception(f"Playwright timed out loading page: {url}")
+    except Exception as e:
+        logger.error(f"Playwright error for {url}: {str(e)}")
+        raise e
+    finally:
+        await context.close()  # 关闭上下文会自动关闭其中的所有页面
 
-async def create_http_session():
-    """创建HTTP会话，支持代理"""
-    timeout = aiohttp.ClientTimeout(
-        total=NETWORK_CONFIG["timeout"]["total"], 
-        connect=NETWORK_CONFIG["timeout"]["connect"]
-    )
-    
-    proxy_url = create_proxy_connector()
-    
-    # 创建SSL上下文，禁用证书验证以解决代理SSL问题
-    import ssl
-    ssl_context = ssl.create_default_context()
-    ssl_context.check_hostname = False
-    ssl_context.verify_mode = ssl.CERT_NONE
-    
-    if proxy_url:
-        logger.info(f"使用代理: {proxy_url.split('@')[-1] if '@' in proxy_url else proxy_url}")
-        # 创建连接器，使用自定义SSL上下文
-        connector = aiohttp.TCPConnector(
-            ssl=ssl_context,  # 使用自定义SSL上下文
-            limit=100,
-            limit_per_host=30
-        )
-        return aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector
-        ), proxy_url
-    else:
-        # 没有代理时也使用相同的SSL配置以保持一致性
-        connector = aiohttp.TCPConnector(
-            ssl=ssl_context,
-            limit=100,
-            limit_per_host=30
-        )
-        return aiohttp.ClientSession(
-            timeout=timeout,
-            connector=connector
-        ), None
-
-async def process_soup_content(soup, url: str, include_images: bool, include_links: bool, max_length: int) -> PageContent:
+def process_soup_content(soup, url: str, include_images: bool, include_links: bool, max_length: int) -> PageContent:
     """处理BeautifulSoup解析后的内容"""
     # 移除不需要的元素
     for tag in soup(['script', 'style', 'nav', 'footer', 'iframe', 'noscript']):
@@ -376,7 +391,6 @@ async def process_soup_content(soup, url: str, include_images: bool, include_lin
         for img in soup.find_all('img', src=True):
             src = img['src']
             if not src.startswith(('http://', 'https://')):
-                from urllib.parse import urljoin
                 src = urljoin(url, src)
             images.append({
                 'src': src,
@@ -390,7 +404,6 @@ async def process_soup_content(soup, url: str, include_images: bool, include_lin
         for link in soup.find_all('a', href=True):
             href = link['href']
             if not href.startswith(('http://', 'https://')):
-                from urllib.parse import urljoin
                 href = urljoin(url, href)
             links.append({
                 'href': href,
@@ -410,114 +423,7 @@ async def process_soup_content(soup, url: str, include_images: bool, include_lin
         timestamp=format_timestamp()
     )
 
-async def extract_content_with_requests(url: str, include_images: bool, include_links: bool, max_length: int) -> PageContent:
-    """使用requests库提取内容（适用于HTTPS代理）"""
-    import cloudscraper
-    import asyncio
-
-    logger.info(f"Using 'cloudscraper' library for {url}")
-    
-    # 使用更真实的浏览器配置创建scraper
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False
-        }
-    )
-    
-    proxy_config = NETWORK_CONFIG.get("proxy", {})
-    proxy_url = proxy_config.get("https") or proxy_config.get("http")
-    
-    proxies = {
-        'http': proxy_url,
-        'https': proxy_url
-    } if proxy_url else None
-
-    max_retries = NETWORK_CONFIG["retries"]["max_attempts"]
-    delay_factor = NETWORK_CONFIG["retries"]["delay_factor"]
-    
-    soup = None
-    for attempt in range(max_retries):
-        try:
-            loop = asyncio.get_event_loop()
-            response = await loop.run_in_executor(
-                None,
-                lambda: scraper.get(
-                    url,
-                    proxies=proxies,
-                    timeout=(NETWORK_CONFIG["timeout"]["connect"], NETWORK_CONFIG["timeout"]["total"])
-                )
-            )
-            
-            response.raise_for_status()
-            
-            soup = BeautifulSoup(response.text, 'html.parser')
-            break
-            
-        except Exception as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt + 1} with 'cloudscraper' failed for {url}: {str(e)}, retrying...")
-                await asyncio.sleep(delay_factor * (attempt + 1))
-                continue
-            else:
-                logger.error(f"All {max_retries} 'cloudscraper' attempts failed for {url}")
-                raise e
-
-    if soup is None:
-        raise Exception("Failed to fetch content with 'cloudscraper' after all retries.")
-
-    return await process_soup_content(soup, url, include_images, include_links, max_length)
-
-async def extract_content_with_aiohttp(url: str, include_images: bool, include_links: bool, max_length: int) -> PageContent:
-    """使用aiohttp提取内容（适用于HTTP或无代理）"""
-    logger.info(f"Using 'aiohttp' library for {url}")
-    headers = {
-        'User-Agent': NETWORK_CONFIG["user_agent"],
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9,zh-CN,zh;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-    }
-    
-    max_retries = NETWORK_CONFIG["retries"]["max_attempts"]
-    delay_factor = NETWORK_CONFIG["retries"]["delay_factor"]
-    
-    soup = None
-    for attempt in range(max_retries):
-        try:
-            session, proxy_url = await create_http_session()
-            async with session:
-                request_kwargs = {
-                    'headers': headers,
-                    'allow_redirects': True
-                }
-                if proxy_url:
-                    request_kwargs['proxy'] = proxy_url
-                
-                async with session.get(url, **request_kwargs) as response:
-                    response.raise_for_status() # 如果状态码不是2xx，会抛出ClientResponseError
-                    
-                    text = await response.text()
-                    soup = BeautifulSoup(text, 'html.parser')
-                    break  # 成功获取，跳出重试循环
-                        
-        except (aiohttp.ServerTimeoutError, aiohttp.ClientConnectorError, aiohttp.ClientError, asyncio.TimeoutError) as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"Attempt {attempt + 1} with 'aiohttp' failed for {url}: {str(e)}, retrying...")
-                await asyncio.sleep(delay_factor * (attempt + 1))  # 递增延迟
-                continue
-            else:
-                logger.error(f"All {max_retries} 'aiohttp' attempts failed for {url}")
-                raise e # 重新抛出异常，由上层处理
-
-    if soup is None:
-        raise Exception("Failed to fetch content with 'aiohttp' after all retries.")
-    
-    return await process_soup_content(soup, url, include_images, include_links, max_length)
-
-
-async def extract_clean_content(url: str, include_images: bool = False, include_links: bool = False, max_length: int = 10000) -> PageContent:
+async def extract_clean_content(browser, url: str, include_images: bool = False, include_links: bool = False, max_length: int = 10000) -> PageContent:
     """提取网页的干净内容"""
     logger.debug(f"Starting content extraction for URL: {url}")
     
@@ -530,17 +436,8 @@ async def extract_clean_content(url: str, include_images: bool = False, include_
         )
     
     try:
-        # 检查是否为HTTPS且启用了代理
-        proxy_config = NETWORK_CONFIG.get("proxy", {})
-        proxy_enabled = proxy_config.get("enabled", False)
-        is_https = url.startswith('https://')
-        
-        if is_https and proxy_enabled:
-            # 对于HTTPS + 代理，使用requests库（更可靠）
-            return await extract_content_with_requests(url, include_images, include_links, max_length)
-        else:
-            # 对于HTTP或无代理，使用aiohttp
-            return await extract_content_with_aiohttp(url, include_images, include_links, max_length)
+        # 直接使用 Playwright 进行内容提取
+        return await extract_content_with_playwright(browser, url, include_images, include_links, max_length)
             
     except Exception as e:
         logger.error(f"Error extracting content from {url}: {str(e)}")
@@ -552,91 +449,100 @@ async def extract_clean_content(url: str, include_images: bool = False, include_
             timestamp=format_timestamp()
         )
 
-async def capture_screenshot(url: str, width: int = 1280, height: int = 720, full_page: bool = False, format: str = "png") -> ScreenshotResponse:
-    """模拟截图功能（实际需要浏览器引擎）"""
+async def capture_screenshot(browser, url: str, width: int = 1280, height: int = 720, full_page: bool = False, format: str = "png") -> ScreenshotResponse:
+    """使用Playwright捕获网页截图"""
     logger.debug(f"Screenshot request for URL: {url}")
     
-    # 这里是模拟实现，实际需要使用 Playwright 或 Selenium
-    # 由于没有浏览器引擎，返回模拟响应
+    context = await browser.new_context()
+    page = await context.new_page()
+    await page.set_viewport_size({"width": width, "height": height})
     
-    return ScreenshotResponse(
-        url=url,
-        screenshot_base64=None,  # 实际实现需要返回base64编码的图片
-        width=width,
-        height=height,
-        format=format,
-        error="Screenshot service not implemented - requires browser engine",
-        timestamp=format_timestamp()
-    )
+    try:
+        await page.goto(url, timeout=NETWORK_CONFIG["timeout"].get("read", 60) * 1000)
+        
+        screenshot_bytes = await page.screenshot(
+            path=None, 
+            full_page=full_page,
+            type=format if format in ['png', 'jpeg'] else 'png'
+        )
+        
+        screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
+        
+        return ScreenshotResponse(
+            url=url,
+            screenshot_base64=screenshot_base64,
+            width=width,
+            height=height,
+            format=format,
+            timestamp=format_timestamp()
+        )
+    except Exception as e:
+        logger.error(f"Error capturing screenshot for {url}: {str(e)}")
+        return ScreenshotResponse(
+            url=url,
+            error=str(e),
+            width=width,
+            height=height,
+            format=format,
+            timestamp=format_timestamp()
+        )
+    finally:
+        await context.close()
 
-async def analyze_page_datetime(url: str) -> DatetimeInfo:
+async def analyze_page_datetime(browser, url: str) -> DatetimeInfo:
     """分析网页的发布/更新时间"""
     logger.debug(f"Analyzing datetime for URL: {url}")
     
     try:
-        timeout = aiohttp.ClientTimeout(total=45, connect=15)  # 增加超时时间
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
+        # 使用 Playwright 获取页面内容进行分析
+        context = await browser.new_context()
+        page = await context.new_page()
+        await page.goto(url, timeout=NETWORK_CONFIG["timeout"].get("read", 60) * 1000)
+        html_content = await page.content()
+        await context.close()
+
+        soup = BeautifulSoup(html_content, 'html.parser')
         
-        session, proxy_url = await create_http_session()
-        async with session:
-            request_kwargs = {
-                'headers': headers
-            }
-            if proxy_url:
-                request_kwargs['proxy'] = proxy_url
-                
-            async with session.get(url, **request_kwargs) as response:
-                if response.status != 200:
-                    return DatetimeInfo(
-                        url=url,
-                        error=f'HTTP {response.status}'
-                    )
-                
-                text = await response.text()
-                soup = BeautifulSoup(text, 'html.parser')
-                
-                # 查找各种时间标记
-                published_date = None
-                updated_date = None
-                detected_dates = []
-                
-                # 查找元数据中的时间
-                date_metas = [
-                    'article:published_time', 'article:modified_time',
-                    'datePublished', 'dateModified', 'pubdate'
-                ]
-                
-                for meta_name in date_metas:
-                    meta = soup.find('meta', {'property': meta_name}) or soup.find('meta', {'name': meta_name})
-                    if meta and meta.get('content'):
-                        date_str = meta['content']
-                        detected_dates.append(date_str)
-                        if 'published' in meta_name.lower() and not published_date:
-                            published_date = date_str
-                        elif 'modified' in meta_name.lower() and not updated_date:
-                            updated_date = date_str
-                
-                # 查找time标签
-                for time_tag in soup.find_all('time'):
-                    datetime_attr = time_tag.get('datetime')
-                    if datetime_attr:
-                        detected_dates.append(datetime_attr)
-                        if not published_date:
-                            published_date = datetime_attr
-                
-                # 简单的置信度计算
-                confidence = min(1.0, len(detected_dates) * 0.3)
-                
-                return DatetimeInfo(
-                    url=url,
-                    published_date=published_date,
-                    updated_date=updated_date,
-                    detected_dates=detected_dates,
-                    confidence=confidence,
-                    method='meta_and_time_tags'
-                )
+        # 查找各种时间标记
+        published_date = None
+        updated_date = None
+        detected_dates = []
+        
+        # 查找元数据中的时间
+        date_metas = [
+            'article:published_time', 'article:modified_time',
+            'datePublished', 'dateModified', 'pubdate'
+        ]
+        
+        for meta_name in date_metas:
+            meta = soup.find('meta', {'property': meta_name}) or soup.find('meta', {'name': meta_name})
+            if meta and meta.get('content'):
+                date_str = meta['content']
+                detected_dates.append(date_str)
+                if 'published' in meta_name.lower() and not published_date:
+                    published_date = date_str
+                elif 'modified' in meta_name.lower() and not updated_date:
+                    updated_date = date_str
+        
+        # 查找time标签
+        for time_tag in soup.find_all('time'):
+            datetime_attr = time_tag.get('datetime')
+            if datetime_attr:
+                detected_dates.append(datetime_attr)
+                if not published_date:
+                    published_date = datetime_attr
+        
+        # 简单的置信度计算
+        confidence = min(1.0, len(detected_dates) * 0.3)
+        
+        return DatetimeInfo(
+            url=url,
+            published_date=published_date,
+            updated_date=updated_date,
+            detected_dates=detected_dates,
+            confidence=confidence,
+            method='meta_and_time_tags'
+        )
                 
     except Exception as e:
         logger.error(f"Error analyzing datetime for {url}: {str(e)}")
@@ -815,12 +721,14 @@ async def root():
           - https://news.ycombinator.com/item?id=xxxxx
           """,
           tags=["内容提取"])
-async def read_url(request: ReadUrlRequest):
+async def read_url(request: ReadUrlRequest, http_request: Request):
     """提取网页内容"""
     logger.info(f"Reading URL: {request.url}")
     
     try:
+        browser = http_request.app.state.browser
         content = await extract_clean_content(
+            browser=browser,
             url=request.url,
             include_images=request.include_images,
             include_links=request.include_links,
@@ -857,7 +765,7 @@ async def read_url(request: ReadUrlRequest):
           - 批量数据收集
           """,
           tags=["内容提取"])
-async def parallel_read(request: ParallelReadRequest):
+async def parallel_read(request: ParallelReadRequest, http_request: Request):
     """并行读取多个网页"""
     logger.info(f"Parallel reading {len(request.urls)} URLs")
     
@@ -870,10 +778,12 @@ async def parallel_read(request: ParallelReadRequest):
                 detail=f"最多支持同时读取 {max_parallel} 个网页"
             )
         
+        browser = http_request.app.state.browser
         # 创建并发任务
         tasks = []
         for url in request.urls:
             task = extract_clean_content(
+                browser=browser,
                 url=url,
                 include_images=request.include_images,
                 include_links=request.include_links,
@@ -929,12 +839,14 @@ async def parallel_read(request: ParallelReadRequest):
           ```
           """,
           tags=["图像处理"])
-async def screenshot(request: ScreenshotRequest):
+async def screenshot(request: ScreenshotRequest, http_request: Request):
     """网页截图（模拟实现）"""
     logger.info(f"Screenshot request for: {request.url}")
     
     try:
+        browser = http_request.app.state.browser
         screenshot_result = await capture_screenshot(
+            browser=browser,
             url=request.url,
             width=request.width,
             height=request.height,
@@ -973,12 +885,13 @@ async def screenshot(request: ScreenshotRequest):
           - 社交媒体帖子
           """,
           tags=["数据分析"])
-async def analyze_datetime(request: DatetimeAnalysisRequest):
+async def analyze_datetime(request: DatetimeAnalysisRequest, http_request: Request):
     """分析网页的发布/更新时间"""
     logger.info(f"Analyzing datetime for: {request.url}")
     
     try:
-        datetime_info = await analyze_page_datetime(request.url)
+        browser = http_request.app.state.browser
+        datetime_info = await analyze_page_datetime(browser, request.url)
         
         return ApiResponse(
             code=200,
@@ -1008,7 +921,8 @@ async def analyze_datetime(request: DatetimeAnalysisRequest):
           
           **实际实现需要：**
           ```bash
-          pip install duckduckgo-search
+          pip install duckduckgo-search playwright
+          playwright install
           ```
           """,
           tags=["搜索"])
@@ -1127,8 +1041,9 @@ if __name__ == "__main__":
     logger.info(f"Log file: {log_filename}")
     
     uvicorn.run(
-        app,
-        host=SERVICE_CONFIG["host"],
-        port=SERVICE_CONFIG["port"],
-        log_level="info"
+        "app:app",
+        host=SERVICE_CONFIG.get("host", "0.0.0.0"),
+        port=SERVICE_CONFIG.get("port", 8001),
+        log_level="info",
+        reload=False # reload=True might cause issues with the asyncio policy
     )
