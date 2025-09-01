@@ -10,6 +10,10 @@ import logging
 import traceback
 import asyncio
 import aiohttp
+import requests
+import tempfile
+import os
+import aiohttp
 from bs4 import BeautifulSoup
 import base64
 import json
@@ -332,10 +336,23 @@ async def extract_content_with_playwright(browser, url: str, include_images: boo
         
     except PlaywrightTimeoutError:
         logger.error(f"Playwright timed out loading page: {url}")
-        raise Exception(f"Playwright timed out loading page: {url}")
+        return f"Error: Page loading timed out for {url}. This might be due to network issues or the page taking too long to load."
     except Exception as e:
-        logger.error(f"Playwright error for {url}: {str(e)}")
-        raise e
+        error_msg = str(e)
+        logger.error(f"Playwright error for {url}: {error_msg}")
+        
+        # 特殊处理常见错误
+        if "net::ERR_ABORTED" in error_msg:
+            if url.endswith('.pdf'):
+                return f"Error: Cannot access PDF directly at {url}. PDF files may require special handling or may be blocked by the server."
+            else:
+                return f"Error: Access to {url} was aborted. This may be due to server restrictions, proxy issues, or anti-bot measures."
+        elif "net::ERR_FAILED" in error_msg:
+            return f"Error: Failed to connect to {url}. The server may be down or unreachable."
+        elif "net::ERR_TIMED_OUT" in error_msg:
+            return f"Error: Connection to {url} timed out. Please try again later."
+        else:
+            return f"Error: Unable to access {url}. Reason: {error_msg}"
     finally:
         await context.close()  # 关闭上下文会自动关闭其中的所有页面
 
@@ -423,9 +440,94 @@ def process_soup_content(soup, url: str, include_images: bool, include_links: bo
         timestamp=format_timestamp()
     )
 
+async def extract_pdf_content(url: str, max_length: int = 10000) -> PageContent:
+    """尝试提取PDF内容的多种方法"""
+    logger.info(f"Attempting to extract PDF content from: {url}")
+    
+    # 方法1: 尝试通过requests直接下载
+    try:
+        proxy_config = NETWORK_CONFIG.get("proxy", {})
+        proxies = {}
+        if proxy_config.get("http"):
+            proxies["http"] = proxy_config["http"]
+        if proxy_config.get("https"):
+            proxies["https"] = proxy_config["https"]
+            
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, proxies=proxies, timeout=30, stream=True)
+        response.raise_for_status()
+        
+        # 检查是否真的是PDF
+        content_type = response.headers.get('content-type', '').lower()
+        if 'pdf' not in content_type and not url.endswith('.pdf'):
+            logger.warning(f"URL {url} may not be a PDF file")
+        
+        # 尝试安装和使用PyPDF2来解析PDF
+        try:
+            import PyPDF2
+            import io
+            
+            # 下载PDF内容
+            pdf_content = response.content
+            pdf_reader = PyPDF2.PdfReader(io.BytesIO(pdf_content))
+            
+            text_content = ""
+            for page_num in range(min(len(pdf_reader.pages), 10)):  # 限制前10页
+                page = pdf_reader.pages[page_num]
+                text_content += page.extract_text() + "\n"
+            
+            # 清理和截断内容
+            text_content = text_content.strip()
+            if len(text_content) > max_length:
+                text_content = text_content[:max_length] + "..."
+            
+            return PageContent(
+                url=url,
+                title=f"PDF Document: {url.split('/')[-1]}",
+                content=text_content,
+                extraction_status='success',
+                timestamp=format_timestamp()
+            )
+            
+        except ImportError:
+            logger.warning("PyPDF2 not installed. Install with: pip install PyPDF2")
+            return PageContent(
+                url=url,
+                extraction_status='error',
+                error="PDF processing requires PyPDF2 library. Please install with: pip install PyPDF2",
+                timestamp=format_timestamp()
+            )
+        except Exception as pdf_error:
+            logger.error(f"PDF parsing error: {pdf_error}")
+            return PageContent(
+                url=url,
+                title=f"PDF Document: {url.split('/')[-1]}",
+                content=f"PDF file detected but content extraction failed. File size: {len(response.content)} bytes",
+                extraction_status='partial',
+                error=f"PDF parsing failed: {str(pdf_error)}",
+                timestamp=format_timestamp()
+            )
+            
+    except Exception as e:
+        logger.error(f"Failed to download/process PDF from {url}: {e}")
+        return PageContent(
+            url=url,
+            extraction_status='error',
+            error=f"Failed to access PDF: {str(e)}",
+            timestamp=format_timestamp()
+        )
+
 async def extract_clean_content(browser, url: str, include_images: bool = False, include_links: bool = False, max_length: int = 10000) -> PageContent:
     """提取网页的干净内容"""
     logger.debug(f"Starting content extraction for URL: {url}")
+    
+    # 检查是否是PDF文件
+    if url.endswith('.pdf') or 'pdf' in url.lower():
+        logger.info(f"Detected PDF URL: {url}, using PDF extraction method")
+        return await extract_pdf_content(url, max_length)
     
     if not url or not url.startswith(('http://', 'https://')):
         return PageContent(
@@ -437,7 +539,18 @@ async def extract_clean_content(browser, url: str, include_images: bool = False,
     
     try:
         # 直接使用 Playwright 进行内容提取
-        return await extract_content_with_playwright(browser, url, include_images, include_links, max_length)
+        result = await extract_content_with_playwright(browser, url, include_images, include_links, max_length)
+        
+        # 检查是否返回错误信息
+        if isinstance(result, str) and result.startswith("Error:"):
+            return PageContent(
+                url=url,
+                extraction_status='error',
+                error=result,
+                timestamp=format_timestamp()
+            )
+        else:
+            return result
             
     except Exception as e:
         logger.error(f"Error extracting content from {url}: {str(e)}")
@@ -1043,7 +1156,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host=SERVICE_CONFIG.get("host", "0.0.0.0"),
-        port=SERVICE_CONFIG.get("port", 8001),
+        port=SERVICE_CONFIG.get("port", 8002),
         log_level="info",
         reload=False # reload=True might cause issues with the asyncio policy
     )
