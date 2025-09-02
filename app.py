@@ -1156,7 +1156,7 @@ if __name__ == "__main__":
     uvicorn.run(
         "app:app",
         host=SERVICE_CONFIG.get("host", "0.0.0.0"),
-        port=SERVICE_CONFIG.get("port", 8002),
+        port=SERVICE_CONFIG.get("port", 8001),
         log_level="info",
         reload=False # reload=True might cause issues with the asyncio policy
     )
